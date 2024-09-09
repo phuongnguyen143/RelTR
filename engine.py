@@ -16,6 +16,7 @@ import util.misc as utils
 from util.box_ops import rescale_bboxes
 from lib.evaluation.sg_eval import BasicSceneGraphEvaluator, calculate_mR_from_evaluator_list
 from lib.openimages_evaluation import task_evaluation_sg
+from lib.fpn.box_utils import compute_iou
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -130,6 +131,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, arg
 
         if args.dataset == 'vg':
             evaluate_rel_batch(outputs, targets, evaluator, evaluator_list)
+            evaluate_batch_predcls(outputs, targets, evaluator, evaluator_list)
         else:
             evaluate_rel_batch_oi(outputs, targets, all_results)
 
@@ -142,11 +144,13 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, arg
 
     if args.dataset == 'vg':
         evaluator['sgdet'].print_stats()
+        evaluator['predcls'].print_stats()
     else:
         task_evaluation_sg.eval_rel_results(all_results, 100, do_val=True, do_vis=False)
 
     if args.eval and args.dataset == 'vg':
         calculate_mR_from_evaluator_list(evaluator_list, 'sgdet')
+        calculate_mR_from_evaluator_list(evaluator_list, 'predcls')
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -235,3 +239,103 @@ def evaluate_rel_batch_oi(outputs, targets, all_results):
                            'gt_prd_labels': relation_idx[:, 2]
                            }
         all_results.append(img_result_dict)
+
+def evaluate_batch_predcls(outputs, targets, evaluator, evaluator_list):
+
+    #TODO
+    for batch, target in enumerate(targets):
+        target_bboxes_scaled = rescale_bboxes(target['boxes'].cpu(), torch.flip(target['orig_size'],dims=[0]).cpu()).clone().numpy() # recovered boxes with original size
+
+        gt_entry = {'gt_classes': target['labels'].cpu().clone().numpy(),
+                    'gt_relations': target['rel_annotations'].cpu().clone().numpy(),
+                    'gt_boxes': target_bboxes_scaled}
+
+
+        sub_bboxes_scaled = rescale_bboxes(outputs['sub_boxes'][batch].cpu(), torch.flip(target['orig_size'],dims=[0]).cpu()).clone().numpy()
+        obj_bboxes_scaled = rescale_bboxes(outputs['obj_boxes'][batch].cpu(), torch.flip(target['orig_size'],dims=[0]).cpu()).clone().numpy()
+
+        
+
+        pred_sub_scores, pred_sub_classes = torch.max(outputs['sub_logits'][batch].softmax(-1)[:, :-1], dim=1)
+        pred_obj_scores, pred_obj_classes = torch.max(outputs['obj_logits'][batch].softmax(-1)[:, :-1], dim=1)
+        rel_scores = outputs['rel_logits'][batch][:,1:-1].softmax(-1)
+
+        pred_sub_classes = pred_sub_classes.cpu().clone().numpy()
+        pred_sub_scores = pred_sub_scores.cpu().clone().numpy()
+        pred_obj_classes = pred_obj_classes.cpu().clone().numpy()
+        pred_obj_scores = pred_obj_scores.cpu().clone().numpy()
+
+        pred_indices, gt_indices = match_indices_from_bbox_gt_subjects_objects(sub_bboxes_scaled, obj_bboxes_scaled, gt_entry['gt_classes'], gt_entry['gt_boxes'], gt_entry['gt_relations'])
+
+        assert(len(pred_indices) == len(gt_indices))
+
+        if len(gt_entry['gt_relations']) >= 1:
+            sub_bboxes_scaled[pred_indices] = gt_entry['gt_boxes'][gt_entry['gt_relations'][gt_indices][:, 0]]
+            obj_bboxes_scaled[pred_indices] = gt_entry['gt_boxes'][gt_entry['gt_relations'][gt_indices][:, 1]]
+            pred_sub_classes[pred_indices] = gt_entry['gt_classes'][gt_entry['gt_relations'][gt_indices][:, 0]]
+            pred_obj_classes[pred_indices] = gt_entry['gt_classes'][gt_entry['gt_relations'][gt_indices][:, 1]]
+            pred_sub_scores[pred_indices] = 1
+            pred_obj_scores[pred_indices] = 1
+        else:
+            sub_bboxes_scaled[pred_indices] = gt_entry['gt_boxes'][gt_entry['gt_relations'][gt_indices][0]]
+            obj_bboxes_scaled[pred_indices] = gt_entry['gt_boxes'][gt_entry['gt_relations'][gt_indices][1]]
+            pred_sub_classes[pred_indices] = gt_entry['gt_classes'][gt_entry['gt_relations'][gt_indices][0]]
+            pred_obj_classes[pred_indices] = gt_entry['gt_classes'][gt_entry['gt_relations'][gt_indices][1]]
+            pred_sub_scores[pred_indices] = 1
+            pred_obj_scores[pred_indices] = 1
+
+        mask = (pred_sub_classes - pred_obj_classes != 0)
+        #  Or just filter out every things that are not matching gt boxes. But the author suggested the things above so I am not sure..
+        #  mask = (pred_sub_scores >= 0.99) & (pred_obj_scores >= 0.99)
+
+        if mask.sum() <= 198:
+            sub_bboxes_scaled = sub_bboxes_scaled[mask]
+            pred_sub_classes = pred_sub_classes[mask]
+            pred_sub_scores = pred_sub_scores[mask]
+            obj_bboxes_scaled = obj_bboxes_scaled[mask]
+            pred_obj_classes = pred_obj_classes[mask]
+            pred_obj_scores = pred_obj_scores[mask]
+            rel_scores = rel_scores[mask]
+
+        pred_entry = {'sub_boxes': sub_bboxes_scaled,
+                    'sub_classes': pred_sub_classes,
+                    'sub_scores': pred_sub_scores,
+                    'obj_boxes': obj_bboxes_scaled,
+                    'obj_classes': pred_obj_classes,
+                    'obj_scores': pred_obj_scores,
+                'rel_scores': rel_scores.cpu().clone().numpy()}
+
+        evaluator['predcls'].evaluate_scene_graph_entry(gt_entry, pred_entry)
+
+        if evaluator_list is not None:
+            for pred_id, _, evaluator_rel in evaluator_list:
+                gt_entry_rel = gt_entry.copy()
+                mask = np.in1d(gt_entry_rel['gt_relations'][:, -1], pred_id)
+                gt_entry_rel['gt_relations'] = gt_entry_rel['gt_relations'][mask, :]
+                if gt_entry_rel['gt_relations'].shape[0] == 0:
+                    continue
+                evaluator_rel['predcls'].evaluate_scene_graph_entry(gt_entry_rel, pred_entry)
+
+def match_indices_from_bbox_gt_subjects_objects(sub_bboxes_scaled, obj_bboxes_scaled, gt_classes, gt_boxes, gt_relations):
+    assert(gt_boxes.shape[0] == gt_classes.shape[0])
+    assert(sub_bboxes_scaled.shape[0] == obj_bboxes_scaled.shape[0])
+    subjects_objects = gt_relations[:, :2]
+    gt_sub_obj_bboxes = gt_boxes[subjects_objects]
+
+    gt_indices = []
+    pred_indices = []
+    iou_thresh = 0.5
+    for gt_ind in range(gt_sub_obj_bboxes.shape[0]):
+        gt_box1, gt_box2 = gt_sub_obj_bboxes[gt_ind]
+        gt_box1 = gt_box1
+        gt_box2 = gt_box2
+        for pred_ind in range(sub_bboxes_scaled.shape[0]):
+            sub_iou = compute_iou(gt_box1, sub_bboxes_scaled[pred_ind])
+            obj_iou = compute_iou(gt_box2, obj_bboxes_scaled[pred_ind])
+
+            if sub_iou >= iou_thresh and obj_iou >= iou_thresh:
+                gt_indices.append(gt_ind)
+                pred_indices.append(pred_ind)
+                break
+        
+    return pred_indices, gt_indices
